@@ -7,6 +7,7 @@ class FileSummary(BaseModel):
     feature_count: int
     crs: str | None
     status: str
+    error: str | None = None
     model_config = ConfigDict(from_attributes=True)
 
 class FeatureResult(BaseModel):

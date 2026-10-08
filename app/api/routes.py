@@ -1,5 +1,6 @@
 import logging
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 from ..database import get_db
@@ -10,15 +11,17 @@ from ..services.files import create_upload, UploadError
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/files", tags=["files"])
 
-@router.post("/", response_model=FileSummary, status_code=201)
+@router.post("/", response_model=FileSummary, status_code=201, responses={422: {"model": FileSummary}})
 def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
         record = create_upload(file.filename, file.file, db)
     except UploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    summary = FileSummary.model_validate(record)
     if record.status == "FAILED":
-        raise HTTPException(status_code=422, detail=record.error or "Could not process file")
-    return record
+        # Return the persisted ID with the failure so clients can inspect it later.
+        return JSONResponse(status_code=422, content=summary.model_dump())
+    return summary
 
 @router.get("/{file_id}/", response_model=FileSummary)
 def get_file(file_id: str, db: Session = Depends(get_db)):

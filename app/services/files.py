@@ -1,11 +1,15 @@
+import io
 import logging
 import os
 import tempfile
+import uuid
 import zipfile
 from pathlib import Path
 from typing import BinaryIO
+
 import geopandas as gpd
 from sqlalchemy.orm import Session
+
 from ..models import FileRecord, FeatureRecord
 from .measurement import measure_geometry, _json_value
 
@@ -36,31 +40,40 @@ def validate_upload(filename: str | None, stream: BinaryIO) -> tuple[str, bytes]
     data = b"".join(chunks)
     if ext == ".zip":
         try:
-            with zipfile.ZipFile(__import__("io").BytesIO(data)) as archive:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
                 entries = archive.infolist()
-                for item in entries:
-                    normalized = item.filename.replace("\\", "/")
-                    if normalized.startswith("/") or any(part == ".." for part in normalized.split("/")):
+                stems: dict[str, set[str]] = {}
+                for entry in entries:
+                    normalized = entry.filename.replace("\\", "/")
+                    parts = normalized.split("/")
+                    if normalized.startswith("/") or any(part == ".." for part in parts) or (parts and ":" in parts[0]):
                         raise UploadError("ZIP contains an unsafe path")
-                names = {Path(e.filename.replace("\\", "/")).name.lower() for e in entries if not e.is_dir()}
-                if not {".shp", ".shx", ".dbf"}.issubset({Path(n).suffix for n in names}):
-                    raise UploadError("ZIP must contain .shp, .shx, and .dbf files")
+                    if not entry.is_dir():
+                        member = Path(parts[-1])
+                        stems.setdefault(member.stem.lower(), set()).add(member.suffix.lower())
+                required = {".shp", ".shx", ".dbf"}
+                if not any(required.issubset(suffixes) for suffixes in stems.values()):
+                    raise UploadError("ZIP must contain matching .shp, .shx, and .dbf files")
         except zipfile.BadZipFile as exc:
             raise UploadError("Invalid or corrupt ZIP file") from exc
     return safe_name, data
 
 def _read_layers(path: Path, ext: str):
     if ext == ".kml":
-        import fiona
-        try:
-            fiona.drvsupport.supported_drivers["KML"] = "rw"
-        except Exception:
-            pass
         layers = gpd.list_layers(path)
         if layers.empty:
             return []
         return [gpd.read_file(path, layer=row["name"], engine="pyogrio") for _, row in layers.iterrows()]
-    return [gpd.read_file(path, engine="pyogrio")]
+    # Extract the validated archive into an isolated temp directory. This supports
+    # both root-level and nested shapefiles and handles uppercase sidecar suffixes.
+    with tempfile.TemporaryDirectory(prefix="geospatial-") as temporary:
+        root = Path(temporary)
+        with zipfile.ZipFile(path) as archive:
+            archive.extractall(root)
+        candidates = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() == ".shp"]
+        if not candidates:
+            raise ValueError("ZIP contains no shapefile")
+        return [gpd.read_file(candidate, engine="pyogrio") for candidate in sorted(candidates)]
 
 def process_file(record: FileRecord, db: Session) -> None:
     try:
@@ -73,7 +86,8 @@ def process_file(record: FileRecord, db: Session) -> None:
             for _, row in frame.iterrows():
                 geom = row.geometry
                 if geom is not None and getattr(geom, "has_z", False):
-                    geom = __import__("shapely").force_2d(geom)
+                    from shapely import force_2d
+                    geom = force_2d(geom)
                 props = {str(key): _json_value(value) for key, value in row.drop(labels=[frame.geometry.name]).items()}
                 measured = measure_geometry(geom, frame.crs.to_string() if frame.crs else None)
                 db.add(FeatureRecord(file_id=record.id, feature_index=feature_index,
@@ -96,7 +110,7 @@ def process_file(record: FileRecord, db: Session) -> None:
 def create_upload(filename: str | None, stream: BinaryIO, db: Session) -> FileRecord:
     name, data = validate_upload(filename, stream)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    file_id = __import__("uuid").uuid4()
+    file_id = uuid.uuid4()
     dest = DATA_DIR / f"{file_id}{Path(name).suffix.lower()}"
     dest.write_bytes(data)
     record = FileRecord(id=str(file_id), filename=name, stored_path=str(dest), status="PROCESSING")

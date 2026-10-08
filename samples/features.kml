@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document><name>Geospatial measurement examples</name>
+    <Folder><name>Basic features</name>
+      <Placemark><name>One square kilometre (approximate)</name><Polygon><outerBoundaryIs><LinearRing><coordinates>3,0 3.00899,0 3.00899,0.00899 3,0.00899 3,0</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>
+      <Placemark><name>One kilometre line (approximate)</name><LineString><coordinates>3,0 3.00899,0</coordinates></LineString></Placemark>
+      <Placemark><name>Point</name><Point><coordinates>3,0,25</coordinates></Point></Placemark>
+    </Folder>
+    <Folder><name>MultiGeometry example</name>
+      <Placemark><name>Two points</name><MultiGeometry><Point><coordinates>3,0</coordinates></Point><Point><coordinates>3.001,0.001</coordinates></Point></MultiGeometry></Placemark>
+    </Folder>
+  </Document>
+</kml>

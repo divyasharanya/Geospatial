@@ -1,47 +1,68 @@
 # geospatial-measurement-api
 
-FastAPI service that accepts KML or zipped ESRI Shapefile datasets, stores each upload and its processed feature measurements in SQLite, and exposes paginated results.
+FastAPI service for KML and zipped ESRI Shapefile uploads, persistent feature measurements, and paginated retrieval.
 
 ## Setup
 
-Requires Python 3.10+ and GDAL support for the installed pyogrio/Fiona wheels. Install and run:
+Requires Python 3.10+.
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+# Windows: .venv\\Scripts\\activate
+# macOS/Linux: source .venv/bin/activate
+python -m pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-The default database is `./geospatial.db`; uploaded originals are kept under `./uploads`. Set `DATABASE_URL` and `UPLOAD_DIR` to override these locations. Docker is also supported with `docker build -t geospatial-measurement-api .` then `docker run -p 8000:8000 geospatial-measurement-api`.
+Default SQLite storage is `./geospatial.db`; source uploads are stored under `./uploads`. Override with `DATABASE_URL` and `UPLOAD_DIR`. Docker: `docker build -t geospatial-measurement-api .` followed by `docker run --rm -p 8000:8000 geospatial-measurement-api`.
 
-## API
+## Samples and API
 
-Upload using multipart field `file` (maximum 50 MiB):
+Ready-to-upload examples are in `samples/`: `features.kml` contains polygon, line, point, folders, and a MultiGeometry; `square_shapefile.zip` contains a 1 km by 1 km polygon and its `.shp`, `.shx`, `.dbf`, and `.prj` sidecars inside a nested folder. `python scripts/create_samples.py` regenerates the zipped shapefile sample. Tests upload both sample files and print their measurements.
+
+Upload with multipart field `file` (maximum 50 MiB):
 
 ```bash
-curl -F 'file=@roads.kml' http://localhost:8000/api/files/
-curl -F 'file=@parcels.zip' http://localhost:8000/api/files/
+curl -F 'file=@samples/features.kml' http://localhost:8000/api/files/
+curl -F 'file=@samples/square_shapefile.zip' http://localhost:8000/api/files/
 curl http://localhost:8000/api/files/{id}/
 curl 'http://localhost:8000/api/files/{id}/measurements/?limit=100&offset=0'
 ```
 
-Upload returns a file summary. Measurements return `{items,total,limit,offset}`; every item includes its feature index, geometry, source CRS, properties, supported flag, measurement CRS, and nullable area/length values. Invalid input gets 400, processing failures get 422, unknown ids get 404, and invalid pagination gets FastAPI's 422 response. Interactive OpenAPI docs are at `/docs`.
+Successful upload response (example):
 
-## Architecture
+```json
+{"id":"4e8ccf90-282f-42d4-87d0-aec6ab473d53","filename":"square_shapefile.zip","feature_count":1,"crs":"EPSG:32631","status":"COMPLETED","error":null}
+```
 
-`app/api` handles HTTP and validation; `app/services` validates uploads and reads/measures geospatial data; `app/models.py` defines SQLAlchemy file and feature tables; `app/schemas.py` defines response contracts. Processing is synchronous: a successful upload is fully parsed and measured before the response returns. SQLite stores JSON geometry/properties alongside numeric measurements to support stable pagination without reparsing.
+`GET /api/files/{id}/` returns the file record:
 
-## CRS handling and design decisions
+```json
+{"id":"4e8ccf90-282f-42d4-87d0-aec6ab473d53","filename":"square_shapefile.zip","feature_count":1,"crs":"EPSG:32631","status":"COMPLETED","error":null}
+```
 
-Geometry is made valid with Shapely `make_valid`; Z coordinates are dropped. Polygonal areas and line lengths are measured after projecting geographic features to a centroid-selected UTM zone. Features near the poles use EPSG:6933. Projected metre CRSs are measured directly; other projected CRSs are transformed to a local metric CRS. Point geometries have no measurement; null, empty, and unsupported geometry types are marked unsupported. Measurements are never calculated in angular degrees. Feature geometry remains in its input CRS in the response.
+A measurements response contains a paginated `items` array. One item looks like:
 
-ZIPs are inspected for traversal paths and required `.shp`, `.shx`, `.dbf` members before GDAL reads them. A `.prj` file is not required by the container validation, but a missing CRS prevents metric measurement and produces a processing error (422). This keeps CRS assumptions explicit rather than silently assigning one.
+```json
+{"index":0,"geometry_type":"Polygon","geometry":{"type":"Polygon","coordinates":[[[500000,0],[501000,0],[501000,1000],[500000,1000],[500000,0]]]},"crs":"EPSG:32631","properties":{"name":"1 km x 1 km square"},"supported":true,"area_m2":1000000.0,"area_hectares":100.0,"length_m":null,"length_km":null,"measurement_crs":"EPSG:32631"}
+```
+
+Processing failures return 422 with the saved record ID, status, and error; use that ID with the GET endpoint to inspect it. Invalid input returns 400, unknown IDs 404, and invalid pagination 422. OpenAPI docs are at `/docs`.
+
+## Architecture and CRS decisions
+
+`app/api` provides HTTP routes; `app/services` validates, reads, and measures data; SQLAlchemy models persist file records and feature JSON/numeric values; Pydantic schemas define responses. Upload processing is synchronous. ZIP paths are checked before isolated extraction. All shapefile component suffixes are treated case-insensitively; matching `.shp`, `.shx`, and `.dbf` files are required.
+
+Shapely `make_valid` repairs invalid geometries and Z coordinates are dropped. Polygon/MultiPolygon area and LineString/MultiLineString length are measured in metres. Geographic data uses a centroid-selected UTM zone, with EPSG:6933 near the poles; projected metre CRSs are used directly. Other projected CRSs are converted to a local metric CRS. Points have no measurement. Empty/null and unsupported geometries are marked unsupported. Missing CRS cannot be measured and results in a persisted FAILED record. Returned geometries retain the source coordinates and CRS.
 
 ## Tests
 
-Run `pytest`. The suite covers KML Z removal, zipped shapefile polygon area (1 km² sanity check), line, point, multipolygon, corrupt ZIP, missing CRS sidecar, validation and 404 behavior.
+Run `python -m pytest -q`. The tests upload both bundled samples and print each measurement result, and cover nested/uppercase shapefile entries, area sanity, KML folders/MultiGeometry/Z, missing `.prj`, corrupt ZIP, and empty geometry.
 
 ## Learnings and future scope
 
-Per-feature local projections avoid treating angular units as metres and make measurements useful across zones, with expected local-projection distortion for very large geometries. Synchronous processing keeps the API simple for modest files; a production deployment should consider a task queue, object storage, upload quotas/authentication, geometry simplification, and explicit antimeridian handling. File retention and database migrations also need operational policies as usage grows.
+- I learned that calculating area in degrees gives misleading results, so I project geographic data before measuring.
+- I learned how a feature's centroid helps choose its local UTM zone for metric measurements.
+- I learned that shapefiles rely on matching sidecar files such as `.shp`, `.shx`, `.dbf`, and `.prj`.
+
+Future work could add background processing for large files, storage retention policies, database migrations, and explicit antimeridian handling.

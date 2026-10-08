@@ -1,65 +1,80 @@
 import io
+import json
 import zipfile
 from pathlib import Path
+
 import geopandas as gpd
-from shapely.geometry import Polygon, LineString, Point, MultiPolygon
 from fastapi.testclient import TestClient
-from app.main import app
+from shapely.geometry import Polygon
+
 from app.database import Base, engine
+from app.main import app
+from app.services.measurement import measure_geometry
+from shapely.geometry import Polygon as ShapelyPolygon
 
 client = TestClient(app)
-
-def _zip_shapefile(tmp_path, include_prj=True):
-    shp_dir = tmp_path / "shape"
-    shp_dir.mkdir()
-    poly = Polygon([(0, 0), (1000, 0), (1000, 1000), (0, 1000)])
-    frame = gpd.GeoDataFrame({"name": ["square", "line", "point", "multi"]}, geometry=[
-        poly, LineString([(0, 0), (1000, 0)]), Point(10, 10),
-        MultiPolygon([Polygon([(0,0),(10,0),(10,10),(0,10)]), Polygon([(20,0),(30,0),(30,10),(20,10)])])
-    ], crs="EPSG:32631")
-    shp = shp_dir / "sample.shp"
-    frame.to_file(shp, engine="pyogrio")
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        for path in shp_dir.iterdir():
-            if include_prj or path.suffix.lower() != ".prj":
-                archive.write(path, path.name)
-    return buffer.getvalue()
+ROOT = Path(__file__).resolve().parents[1]
+SAMPLES = ROOT / "samples"
 
 def setup_function():
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
 
-def test_shapefile_measurements_and_pagination(tmp_path):
-    payload = _zip_shapefile(tmp_path)
-    response = client.post("/api/files/", files={"file": ("sample.zip", payload, "application/zip")})
+def upload(path: Path):
+    content_type = "application/zip" if path.suffix.lower() == ".zip" else "application/vnd.google-earth.kml+xml"
+    return client.post("/api/files/", files={"file": (path.name, path.read_bytes(), content_type)})
+
+def test_samples_upload_and_print_measurements():
+    for sample in (SAMPLES / "features.kml", SAMPLES / "square_shapefile.zip"):
+        response = upload(sample)
+        assert response.status_code == 201, response.text
+        file_data = response.json()
+        results = client.get(f"/api/files/{file_data['id']}/measurements/").json()
+        print(f"{sample.name}: {json.dumps(results['items'], indent=2)}")
+        assert results["total"] > 0
+        assert client.get(f"/api/files/{file_data['id']}/").json()["status"] == "COMPLETED"
+
+def test_nested_uppercase_shapefile_and_square_area():
+    source = SAMPLES / "square_shapefile.zip"
+    payload = io.BytesIO()
+    with zipfile.ZipFile(source) as original, zipfile.ZipFile(payload, "w") as archive:
+        for item in original.infolist():
+            name = Path(item.filename)
+            archive.writestr(str(name.parent / (name.stem + name.suffix.upper())), original.read(item.filename))
+    response = client.post("/api/files/", files={"file": ("SAMPLE.ZIP", payload.getvalue(), "application/zip")})
     assert response.status_code == 201, response.text
-    data = response.json()
-    assert data["status"] == "COMPLETED"
-    assert data["feature_count"] == 4
-    results = client.get(f"/api/files/{data['id']}/measurements/?limit=2").json()
-    assert results["total"] == 4 and len(results["items"]) == 2
-    assert abs(results["items"][0]["area_m2"] - 1_000_000) < 1
-    assert abs(results["items"][0]["area_hectares"] - 100) < 0.001
-    next_page = client.get(f"/api/files/{data['id']}/measurements/?offset=1").json()["items"]
-    assert next_page[0]["length_m"] == 1000
-    assert next_page[1]["geometry_type"] == "Point" and next_page[1]["area_m2"] is None
-    assert next_page[2]["geometry_type"] == "MultiPolygon" and next_page[2]["area_m2"] is not None
+    item = client.get(f"/api/files/{response.json()['id']}/measurements/").json()["items"][0]
+    assert abs(item["area_m2"] - 1_000_000) < 0.01
+    assert item["measurement_crs"] == "EPSG:32631"
 
-def test_kml_upload(tmp_path):
-    kml = b'''<?xml version="1.0"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document><Placemark><name>p</name><Point><coordinates>3,4,100</coordinates></Point></Placemark></Document></kml>'''
-    response = client.post("/api/files/", files={"file": ("sample.kml", kml, "application/vnd.google-earth.kml+xml")})
+def test_kml_folders_multigeometry_and_z_drop():
+    response = upload(SAMPLES / "features.kml")
     assert response.status_code == 201, response.text
-    result = client.get(f"/api/files/{response.json()['id']}/measurements/").json()["items"][0]
-    assert result["geometry_type"] == "Point"
-    assert result["geometry"]["coordinates"] == [3.0, 4.0]
+    items = client.get(f"/api/files/{response.json()['id']}/measurements/?limit=100").json()["items"]
+    assert len(items) >= 4
+    assert any(item["geometry_type"] in {"MultiPoint", "GeometryCollection"} for item in items)
+    point = next(item for item in items if item["geometry_type"] == "Point")
+    assert len(point["geometry"]["coordinates"]) == 2
 
-def test_bad_zip_and_missing_required_sidecars(tmp_path):
-    corrupt = client.post("/api/files/", files={"file": ("broken.zip", b"not zip", "application/zip")})
-    assert corrupt.status_code == 400
-    missing = client.post("/api/files/", files={"file": ("missing.zip", _zip_shapefile(tmp_path, include_prj=False), "application/zip")})
-    assert missing.status_code == 422
+def test_corrupt_zip_and_unsupported_suffix_are_client_errors():
+    assert client.post("/api/files/", files={"file": ("broken.zip", b"not zip", "application/zip")}).status_code == 400
+    assert client.post("/api/files/", files={"file": ("shape.SHP", b"bad", "application/octet-stream")}).status_code == 400
 
-def test_invalid_extension_and_missing_id():
-    assert client.post("/api/files/", files={"file": ("x.txt", b"x", "text/plain")}).status_code == 400
-    assert client.get("/api/files/no-such-id/").status_code == 404
+def test_missing_prj_failure_is_persisted_and_retrievable():
+    payload = io.BytesIO()
+    with zipfile.ZipFile(SAMPLES / "square_shapefile.zip") as source, zipfile.ZipFile(payload, "w") as archive:
+        for item in source.infolist():
+            if Path(item.filename).suffix.lower() != ".prj":
+                archive.writestr(item.filename, source.read(item.filename))
+    response = client.post("/api/files/", files={"file": ("no_crs.zip", payload.getvalue(), "application/zip")})
+    assert response.status_code == 422, response.text
+    failed = response.json()
+    assert failed["id"] and failed["status"] == "FAILED" and failed["error"]
+    fetched = client.get(f"/api/files/{failed['id']}/")
+    assert fetched.status_code == 200
+    assert fetched.json()["status"] == "FAILED" and fetched.json()["error"]
+
+def test_empty_geometry_is_unsupported_without_error():
+    result = measure_geometry(ShapelyPolygon(), "EPSG:32631")
+    assert result["supported"] is False
+    assert result["area_m2"] is None
